@@ -74,6 +74,7 @@ class SyncStreamer:
 
     def _do_stream(self):
         #loop and sync until the end Block(if specified)
+
         while True and (self.end_block is None or self.last_synced_block < self.end_block):
             synced_blocks = 0
 
@@ -94,6 +95,7 @@ class SyncStreamer:
         # greatest Block number in the chain
         current_block = self.blockchain_streamer_adapter.get_current_block_number()
 
+        # remained blocks
         target_block = self._calculate_target_block(current_block, self.last_synced_block)
         blocks_to_sync = max(target_block - self.last_synced_block, 0)
 

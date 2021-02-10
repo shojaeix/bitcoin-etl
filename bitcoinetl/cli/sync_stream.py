@@ -64,7 +64,7 @@ def sync_stream(last_synced_block_file, lag, provider_uri, output, start_block, 
     # initiate BTC streamer adapter
     streamer_adapter = BtcStreamerAdapter(
         bitcoin_rpc=ThreadLocalProxy(lambda: BitcoinRpc(provider_uri)),
-        item_exporter=get_item_exporter(output),
+        item_exporter=get_item_exporter(output), # *
         chain=chain,
         batch_size=batch_size,
         enable_enrich=enrich,
@@ -72,12 +72,12 @@ def sync_stream(last_synced_block_file, lag, provider_uri, output, start_block, 
     )
 
     streamer = SyncStreamer(
-        blockchain_streamer_adapter=streamer_adapter,
+        blockchain_streamer_adapter=streamer_adapter, # *
         last_synced_block_file=last_synced_block_file,
         lag=lag,
-        start_block=start_block,
+        start_block=start_block, #TODO remove from signature
         period_seconds=period_seconds,
-        block_batch_size=block_batch_size,
+        block_batch_size=block_batch_size, #TODO must be 1
         pid_file=pid_file,
     )
     streamer.stream()

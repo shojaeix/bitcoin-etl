@@ -10,6 +10,7 @@ def get_item_exporter(output):
                 'transaction': output + '.transactions'
             },
             message_attributes=('item_id',))
+    #TODO add new explorter: rabbitmq_item_exporter
     else:
         item_exporter = ConsoleItemExporter()
 
