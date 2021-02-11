@@ -22,126 +22,197 @@
 
 
 import logging
-import os
 import time
+import json
 
 from blockchainetl.streaming.streamer_adapter_stub import StreamerAdapterStub
-from blockchainetl.file_utils import smart_open
+import threading
+from time import sleep
+
+import pika
 
 
 class SyncStreamer:
     def __init__(
             self,
             blockchain_streamer_adapter=StreamerAdapterStub(),
-            last_synced_block_file='last_synced_block.txt',
-            lag=0,
-            start_block=None,
-            end_block=None,
             period_seconds=10,
-            block_batch_size=10,
             retry_errors=True,
-            pid_file=None):
+            propagate_logs=False,
+            rabbit_host="localhost",
+            rabbit_port=5672,
+            signals_queue="queue-signals",
+    ):
+
+        self.rabbit_host = rabbit_host
+        self.rabbit_port = rabbit_port
+        self._last_signal_processed = False
         self.blockchain_streamer_adapter = blockchain_streamer_adapter
-        self.last_synced_block_file = last_synced_block_file
-        self.lag = lag
-        self.start_block = start_block
-        self.end_block = end_block
         self.period_seconds = period_seconds
-        self.block_batch_size = block_batch_size
         self.retry_errors = retry_errors
-        self.pid_file = pid_file
+        self.signals_queue = signals_queue
+        self.propagate_logs = propagate_logs
 
-        if self.start_block is not None or not os.path.isfile(self.last_synced_block_file):
-            init_last_synced_block_file((self.start_block or 0) - 1, self.last_synced_block_file)
+        # threading.Thread(target=self.send_test_signals).start()
+        self._listen_for_signals_in_a_new_thread()
 
-        self.last_synced_block = read_last_synced_block(self.last_synced_block_file)
+        # disable RabbitMQ debug logs
+        logging.getLogger("pika").propagate = self.propagate_logs
 
     def stream(self):
         try:
-            #prepare
-            if self.pid_file is not None:
-                logging.info('Creating pid file {}'.format(self.pid_file))
-                write_to_file(self.pid_file, str(os.getpid()))
             self.blockchain_streamer_adapter.open()
-            #run
+            # run
             self._do_stream()
         finally:
-            #cleaning and finish
+            # cleaning and finish
             self.blockchain_streamer_adapter.close()
-            if self.pid_file is not None:
-                logging.info('Deleting pid file {}'.format(self.pid_file))
-                delete_file(self.pid_file)
+
+    def _listen_for_signals_in_a_new_thread(self):
+        threading.Thread(target=self._listen_for_signals).start()
+
+    def _signal_callback(self, ch, method, properties, body):
+        self.last_signal_body = body
+        self._last_signal_processed = False
+        if self.propagate_logs:
+            print(" [x] Received signal %r" % body)
+        pass
+
+    # listen the signals queue and keep the last message in  self.last_signal
+    def _listen_for_signals(self):
+        channel = self._new_rabbit_channel()
+
+        channel.queue_declare(queue=self.signals_queue)
+
+        channel.basic_consume(queue=self.signals_queue,
+                              auto_ack=True,
+                              on_message_callback=self._signal_callback)
+
+        print('Listening for signals')
+        channel.start_consuming()
+
+    # process signals and return next block number(-1 for finishing the stream)
+    def _calculate_next_block(self, last, last_send_time) -> int:
+        # keep sending by order if there is no signal yet
+        if not hasattr(self, "last_signal_body") or self.last_signal_body is None:
+            if self.propagate_logs:
+                print("last signal body is empty")
+            return last + 1
+
+        if self.propagate_logs:
+            print("last signal body: " + self.last_signal_body.decode("utf-8"))
+        # decode the last signal
+        last_signal = json.loads(self.last_signal_body)
+
+        # finish the process if the end block is -1
+        if "end_block" in last_signal and (last_signal["end_block"] == -1):
+            return -1
+
+        if "expecting_block" in last_signal:
+            expecting_block = last_signal["expecting_block"]
+            # ELSE update the next block if signal expecting block > next
+            if expecting_block > last:
+                self._last_signal_processed = True
+                return expecting_block
+            # ELSE nothing, if signal.expectingBlock == next
+            elif expecting_block == last:
+                self._last_signal_processed = True
+                return last + 1
+            # ELSE if signal.ExpectingBlock < next
+            else:
+                if self._last_signal_processed:
+                    return last + 1
+                self._last_signal_processed = True
+                if "timestamp" in last_signal and last_signal["timestamp"] > last_send_time:
+                    return expecting_block
+                # back to expecting block if there is at least 3 block distance
+                elif expecting_block < last - 3:
+                    return expecting_block
+                else:
+                    return last + 1
+
+        return last + 1
+
+    def _new_rabbit_channel(self) -> pika.adapters.blocking_connection.BlockingChannel:
+
+        connection = pika.BlockingConnection(pika.ConnectionParameters(self.rabbit_host))
+        if connection.is_open:
+            return connection.channel()
+        raise Exception("couldn't create a new RabbitMQ connection/channel")
 
     def _do_stream(self):
-        #loop and sync until the end Block(if specified)
+        last = -1
+        next_block = 0
+        last_try = 0
+        last_successful_try = 0
+        latest_block = self._get_latest_block_number()
+        while True:
+            # todo check queue messages limit and wait if limit is reached
 
-        while True and (self.end_block is None or self.last_synced_block < self.end_block):
-            synced_blocks = 0
+            if self.retry_errors:
+                # sleep between failures
+                if last_try > last_successful_try and last_try > time.time() - 3:
+                    sleep(3)
 
+            # if it's not the first loop
+            if last != -1:
+                if self.period_seconds > 0:
+                    sleep(self.period_seconds)
+                # calculate next block base on signals and last block
+                next_block = self._calculate_next_block(last, last_successful_try)
+                if next_block == -1:
+                    break
+
+            if self.propagate_logs:
+                print("Next block should be: " + next_block.__str__())
+
+            last_try = time.time()
+
+            if next_block > latest_block:
+                # update latest block
+                latest_block = self._get_latest_block_number()
+                if next_block > latest_block:
+                    if self.propagate_logs:
+                        print("next_block is greater than latest block. should wait more")
+                    continue
+
+            # Try to stream and send next block
             try:
-                # sync all remain Blocks or raise exception
-                synced_blocks = self._sync_cycle()
+                if self._stream_and_send_block(next_block):
+                    # update last
+                    last = next_block
+                    last_successful_try = time.time()
+
             except Exception as e:
                 # https://stackoverflow.com/a/4992124/1580227
                 logging.exception('An exception occurred while syncing block data.')
                 if not self.retry_errors:
                     raise e
-
-            if synced_blocks <= 0:
-                logging.info('Nothing to sync. Sleeping for {} seconds...'.format(self.period_seconds))
-                time.sleep(self.period_seconds)
-
-    def _sync_cycle(self):
-        # greatest Block number in the chain
-        current_block = self.blockchain_streamer_adapter.get_current_block_number()
-
-        # remained blocks
-        target_block = self._calculate_target_block(current_block, self.last_synced_block)
-        blocks_to_sync = max(target_block - self.last_synced_block, 0)
-
-        logging.info('Current block {}, target block {}, last synced block {}, blocks to sync {}'.format(
-            current_block, target_block, self.last_synced_block, blocks_to_sync))
-
-        if blocks_to_sync != 0:
-            self.blockchain_streamer_adapter.export_all(self.last_synced_block + 1, target_block)
-            logging.info('Writing last synced block {}'.format(target_block))
-            write_last_synced_block(self.last_synced_block_file, target_block)
-            self.last_synced_block = target_block
-
-        return blocks_to_sync
-
-    def _calculate_target_block(self, current_block, last_synced_block):
-        target_block = current_block - self.lag
-        target_block = min(target_block, last_synced_block + self.block_batch_size)
-        target_block = min(target_block, self.end_block) if self.end_block is not None else target_block
-        return target_block
-
-
-def delete_file(file):
-    try:
-        os.remove(file)
-    except OSError:
         pass
 
+    def _stream_and_send_block(self, block_number: int) -> bool:
+        self.blockchain_streamer_adapter.export_all(start_block=block_number, end_block=block_number)
+        return True
 
-def write_last_synced_block(file, last_synced_block):
-    write_to_file(file, str(last_synced_block) + '\n')
+    def _get_latest_block_number(self) -> int:
+        return self.blockchain_streamer_adapter.get_current_block_number()
 
+    def send_test_signals(self):
+        channel = self._new_rabbit_channel()
+        channel.queue_declare(self.signals_queue)
+        signal_body = str.encode(json.dumps({"expecting_block": 390000, "end_block": 300000}))
+        channel.basic_publish(exchange="", routing_key=self.signals_queue, body=signal_body)
 
-def init_last_synced_block_file(start_block, last_synced_block_file):
-    if os.path.isfile(last_synced_block_file):
-        raise ValueError(
-            '{} should not exist if --start-block option is specified. '
-            'Either remove the {} file or the --start-block option.'
-                .format(last_synced_block_file, last_synced_block_file))
-    write_last_synced_block(last_synced_block_file, start_block)
+        sleep(10)
 
+        signal_body = str.encode(json.dumps({"expecting_block": 400000}))
+        channel.basic_publish(exchange="", routing_key=self.signals_queue, body=signal_body)
 
-def read_last_synced_block(file):
-    with smart_open(file, 'r') as last_synced_block_file:
-        return int(last_synced_block_file.read())
+        sleep(10)
+        signal_body = str.encode(json.dumps({"expecting_block": 390000, "end_block": 420000}))
+        channel.basic_publish(exchange="", routing_key=self.signals_queue, body=signal_body)
 
-
-def write_to_file(file, content):
-    with smart_open(file, 'w') as file_handle:
-        file_handle.write(content)
+        sleep(20)
+        signal_body = str.encode(json.dumps({"end_block": -1}))
+        channel.basic_publish(exchange="", routing_key=self.signals_queue, body=signal_body)
+        pass
