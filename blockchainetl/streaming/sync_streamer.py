@@ -25,6 +25,8 @@ import logging
 import time
 import json
 
+from pika.exceptions import AMQPConnectionError
+
 from blockchainetl.streaming.streamer_adapter_stub import StreamerAdapterStub
 import threading
 from time import sleep
@@ -53,11 +55,17 @@ class SyncStreamer:
         self.signals_queue = signals_queue
         self.propagate_logs = propagate_logs
 
+        # disable RabbitMQ debug logs
+        logging.getLogger("pika").propagate = self.propagate_logs
+        
+        self.make_sure_rabbit_connection_is_open()
+
         # threading.Thread(target=self.send_test_signals).start()
         self._listen_for_signals_in_a_new_thread()
 
-        # disable RabbitMQ debug logs
-        logging.getLogger("pika").propagate = self.propagate_logs
+    def make_sure_rabbit_connection_is_open(self) -> bool:
+        channel = self._new_rabbit_channel()
+        return channel.connection.is_open
 
     def stream(self):
         try:
@@ -133,12 +141,15 @@ class SyncStreamer:
 
         return last + 1
 
+    # may raise pika.exceptions.AMQPConnectionError
     def _new_rabbit_channel(self) -> pika.adapters.blocking_connection.BlockingChannel:
-
-        connection = pika.BlockingConnection(pika.ConnectionParameters(self.rabbit_host))
-        if connection.is_open:
-            return connection.channel()
-        raise Exception("couldn't create a new RabbitMQ connection/channel")
+        try:
+            connection = pika.BlockingConnection(pika.ConnectionParameters(host=self.rabbit_host, port=self.rabbit_port))
+            if connection.is_open:
+                return connection.channel()
+        except AMQPConnectionError as e:
+            logging.error("Can't connect to the RabbitMQ. Please check the credentials, network and ...")
+            raise e
 
     def _do_stream(self):
         last = -1
